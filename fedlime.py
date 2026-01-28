@@ -26,7 +26,7 @@ from sklearn.metrics import average_precision_score
 from sklearn.metrics.pairwise import cosine_similarity
 from lime.lime_tabular import LimeTabularExplainer
 
-from utilities_trustfed import all_metrics
+from utilities_fedlime import all_metrics
 from load_data_trustfed import get_data, load_dataset
 
 

@@ -16,10 +16,10 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, r2_score
 from lime.lime_tabular import LimeTabularExplainer
 
-from utilities_trustfed import all_metrics
+from utilities_fedlime import all_metrics
 from load_data_trustfed import get_data, load_dataset
 
 
@@ -73,6 +73,30 @@ def make_predict_proba_from_logits(model: nn.Module, device):
         return np.vstack([p0, p1]).T  # (n, 2)
 
     return predict_proba
+
+
+def compute_global_fidelity(
+    model: nn.Module,
+    X_test: torch.Tensor,
+    y_test: torch.Tensor,
+    global_mean_abs: np.ndarray,
+    device,
+):
+    model.eval()
+    X_np = X_test.detach().cpu().numpy()
+    
+    with torch.no_grad():
+        logits = model(X_test).squeeze()
+        y_prob_actual = torch.sigmoid(logits).cpu().numpy()
+    
+    X_normalized = (X_np - X_np.mean(axis=0)) / (X_np.std(axis=0) + 1e-10)
+    lime_predictions = np.dot(X_normalized, global_mean_abs)
+    
+    lime_predictions = (lime_predictions - lime_predictions.min()) / (lime_predictions.max() - lime_predictions.min() + 1e-10)
+    
+    r2 = r2_score(y_prob_actual, lime_predictions)
+    
+    return float(r2)
 
 
 def main():
@@ -210,6 +234,7 @@ def main():
         # Aggregate mean abs weights across explained instances (global)
         n_features = X_np.shape[1]
         W = []
+        fidelity_scores = [] 
         for i in idx:
             exp = explainer.explain_instance(
                 data_row=X_np[i],
@@ -218,24 +243,44 @@ def main():
                 num_samples=args.lime_num_samples,
             )
 
-            # ✅ ADD THIS LINE (save per-instance explanation as HTML)
-            exp.save_to_file(os.path.join(destination, f"lime_instance_{int(i)}.html"))            
+            if len(W) < 5:
+                exp.save_to_file(os.path.join(destination, f"lime_instance_{int(i)}.html"))
+            
             weights_for_class1 = dict(exp.as_map()[1])
             w = np.zeros(n_features, dtype=np.float64)
             for feat_idx, weight in weights_for_class1.items():
                 w[int(feat_idx)] = float(weight)
             W.append(w)
+            
+            fidelity_scores.append(float(exp.score))
 
         W = np.vstack(W)
         global_mean_abs = np.mean(np.abs(W), axis=0)
+        
+        avg_instance_fidelity = np.mean(fidelity_scores)
+        
+        print("Computing global fidelity on test set...")
+        global_fidelity_test = compute_global_fidelity(
+            model=model,
+            X_test=X_test,
+            y_test=y_test,
+            global_mean_abs=global_mean_abs,
+            device=device,
+        )
 
         top_idx = np.argsort(-global_mean_abs)[:10]
         print("\nTop 10 global LIME features (mean abs weight):")
         for j in top_idx:
             print(f"{column_names_list[j]}: {float(global_mean_abs[j]):.6f}")
+        
+        print("\n[LIME] Fidelity Scores (R² - how well LIME approximates the model):")
+        print(f"  Per-instance average (training): {avg_instance_fidelity:.4f}")
+        print(f"  Global (test set): {global_fidelity_test:.4f}")
 
+        # Save results
         np.save(os.path.join(destination, "lime_global_mean_abs.npy"), global_mean_abs)
         np.save(os.path.join(destination, "lime_instance_weights.npy"), W)
+        np.save(os.path.join(destination, "lime_global_fidelity.npy"), np.array([global_fidelity_test], dtype=np.float64))
 
     print(f"\nDone. Saved results to: {destination}")
 

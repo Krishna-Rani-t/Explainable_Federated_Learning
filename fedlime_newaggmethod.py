@@ -9,12 +9,13 @@
 # LIME:
 #   - Runs ONLY at the END of training (after all FedAvg rounds)
 #   - Runs locally on each client
-#   - Server aggregates ONLY summary stats (mean absolute LIME weights) using FedAvg weights (n_client)
+#   - **LOCAL DIFFERENTIAL PRIVACY**: Each client adds Gaussian noise to their LIME results BEFORE sending to server
+#   - Server aggregates NOISY client results using FedAvg weights (n_client)
 #
 # LIME actions (choose ONE):
 #   --lime_action none      -> no LIME
 #   --lime_action aggregate -> FedAvg aggregate + similarity + prints + saves .npy
-#   --lime_action noise     -> same as aggregate, then add Gaussian noise to GLOBAL weights
+#   --lime_action noise     -> same as aggregate, with client-level noise (local DP)
 #   --lime_action rank      -> aggregate (optionally with noise) + print/save top-k ranking
 #   --lime_action bins      -> aggregate (optionally with noise) + print/save High/Medium/Low bins
 #   --lime_action all       -> aggregate + (optional noise) + ranking + bins
@@ -30,7 +31,7 @@ from sklearn.metrics import average_precision_score
 from sklearn.metrics.pairwise import cosine_similarity
 from lime.lime_tabular import LimeTabularExplainer
 
-from utilities_trustfed import all_metrics
+from utilities_fedlime import all_metrics
 from load_data_trustfed import get_data, load_dataset
 
 
@@ -156,6 +157,8 @@ def client_lime_summary(
     num_samples: int,
     device,
     seed: int,
+    noise_std: float = 0.0,
+    noise_clip_nonneg: bool = True,
 ):
     X1, y1, s1, y1_potential = get_data(client_name, clients_data)
     X_np = X1.detach().cpu().numpy()
@@ -170,6 +173,7 @@ def client_lime_summary(
             "n_explained": 0,
             "mean_abs": np.zeros(X_np.shape[1], dtype=np.float64),
             "mean_signed": np.zeros(X_np.shape[1], dtype=np.float64),
+            "fidelity_scores": [],
         }
 
     idx = rng.choice(n_client, size=n_explain, replace=False)
@@ -185,6 +189,8 @@ def client_lime_summary(
 
     n_features = X_np.shape[1]
     W = []
+    fidelity_scores = []
+    
     for i in idx:
         exp = explainer.explain_instance(
             data_row=X_np[i],
@@ -197,15 +203,54 @@ def client_lime_summary(
         for feat_idx, weight in weights_for_class1.items():
             w[int(feat_idx)] = float(weight)
         W.append(w)
+        
+        # Extract fidelity (R² score) from LIME explanation
+        fidelity_scores.append(float(exp.score))
 
     W = np.vstack(W)
+    mean_abs = np.mean(np.abs(W), axis=0)
+    mean_signed = np.mean(W, axis=0)
+    
+    # Add noise at CLIENT level (local differential privacy)
+    if noise_std and float(noise_std) > 0.0:
+        mean_abs = mean_abs + np.random.normal(0.0, float(noise_std), size=mean_abs.shape)
+        if noise_clip_nonneg:
+            mean_abs = np.clip(mean_abs, 0.0, None)
+    
     return {
         "client": client_name,
         "n_client": n_client,
         "n_explained": int(W.shape[0]),
-        "mean_abs": np.mean(np.abs(W), axis=0),
-        "mean_signed": np.mean(W, axis=0),
+        "mean_abs": mean_abs,
+        "mean_signed": mean_signed,
+        "fidelity_scores": fidelity_scores,
     }
+
+
+def compute_global_fidelity(
+    model: nn.Module,
+    X_test: torch.Tensor,
+    y_test: torch.Tensor,
+    global_mean_abs: np.ndarray,
+    device,
+):
+    from sklearn.metrics import r2_score
+    
+    model.eval()
+    X_np = X_test.detach().cpu().numpy()
+    
+    with torch.no_grad():
+        logits = model(X_test).squeeze()
+        y_prob_actual = torch.sigmoid(logits).cpu().numpy()
+    X_normalized = (X_np - X_np.mean(axis=0)) / (X_np.std(axis=0) + 1e-10)
+    lime_predictions = np.dot(X_normalized, global_mean_abs)
+    
+    lime_predictions = (lime_predictions - lime_predictions.min()) / (lime_predictions.max() - lime_predictions.min() + 1e-10)
+    
+    # Compute R² score
+    r2 = r2_score(y_prob_actual, lime_predictions)
+    
+    return float(r2)
 
 
 def fedavg_aggregate_mean_abs(client_mean_abs: np.ndarray, client_sizes: np.ndarray) -> np.ndarray:
@@ -318,19 +363,21 @@ def federated_lime_report(
                 num_samples=num_samples,
                 device=device,
                 seed=seed,
+                noise_std=noise_std,  # Pass noise to client level
+                noise_clip_nonneg=noise_clip_nonneg,
             )
         )
 
     client_names = [s["client"] for s in summaries]
-    client_mean_abs = np.vstack([s["mean_abs"] for s in summaries])
+    client_mean_abs = np.vstack([s["mean_abs"] for s in summaries])  # Already noisy from clients
     client_sizes = np.array([s["n_client"] for s in summaries], dtype=np.float64)
+    
+    # Collect fidelity scores per client
+    client_fidelity_scores = [s["fidelity_scores"] for s in summaries]
+    client_avg_fidelity = [np.mean(scores) if len(scores) > 0 else 0.0 for scores in client_fidelity_scores]
 
+    # Aggregate the NOISY client results (no additional noise here)
     global_mean_abs = fedavg_aggregate_mean_abs(client_mean_abs, client_sizes)
-
-    if noise_std and float(noise_std) > 0.0:
-        global_mean_abs = global_mean_abs + np.random.normal(0.0, float(noise_std), size=global_mean_abs.shape)
-        if noise_clip_nonneg:
-            global_mean_abs = np.clip(global_mean_abs, 0.0, None)
 
     sim = cosine_similarity(client_mean_abs) if client_mean_abs.shape[0] >= 2 else np.ones((client_mean_abs.shape[0], client_mean_abs.shape[0]))
 
@@ -340,6 +387,7 @@ def federated_lime_report(
         "client_mean_abs": client_mean_abs,
         "global_mean_abs": global_mean_abs,
         "similarity_matrix": sim,
+        "client_fidelity": client_avg_fidelity,
     }
 
 
@@ -487,9 +535,19 @@ def main():
     client_mean_abs = lime_results["client_mean_abs"]
     global_mean_abs = lime_results["global_mean_abs"]
     sim = lime_results["similarity_matrix"]
+    client_fidelity = lime_results["client_fidelity"]
+    
+    # Compute global fidelity
+    global_fidelity = compute_global_fidelity(
+        model=global_model,
+        X_test=X_test,
+        y_test=y_test,
+        global_mean_abs=global_mean_abs,
+        device=device,
+    )
 
     if noise_std > 0:
-        print(f"\n[FedLIME] Gaussian noise enabled on GLOBAL weights: std={noise_std} (clip_nonneg={noise_clip_nonneg})")
+        print(f"\n[FedLIME] Gaussian noise enabled at CLIENT level (local DP): std={noise_std} (clip_nonneg={noise_clip_nonneg})")
 
     # Always print (so you don't have to read .npy)
     print_lime_summary(
@@ -501,6 +559,13 @@ def main():
         sim=sim,
         top_k=args.top_k,
     )
+    print("\n[FedLIME] Fidelity Scores (R² - how well LIME approximates the model):")
+    print(f"  Global Fidelity: {global_fidelity:.4f}")
+    print(f"  Per-Client Fidelity:")
+    for cname, fid in zip(client_names, client_fidelity):
+        print(f"    {cname}: {fid:.4f}")
+    avg_client_fidelity = np.mean(client_fidelity)
+    print(f"  Average Client Fidelity: {avg_client_fidelity:.4f}")
 
     # Always save arrays too
     np.save(os.path.join(destination, "lime_global_mean_abs.npy"), global_mean_abs)
@@ -508,6 +573,8 @@ def main():
     np.save(os.path.join(destination, "lime_similarity.npy"), sim)
     np.save(os.path.join(destination, "lime_client_names.npy"), np.array(client_names, dtype=object))
     np.save(os.path.join(destination, "lime_client_sizes.npy"), np.array(client_sizes, dtype=np.float64))
+    np.save(os.path.join(destination, "lime_client_fidelity.npy"), np.array(client_fidelity, dtype=np.float64))
+    np.save(os.path.join(destination, "lime_global_fidelity.npy"), np.array([global_fidelity], dtype=np.float64))
 
     # Ranking CSV
     if args.lime_action in ["rank", "all", "noise"]:
